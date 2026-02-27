@@ -2,11 +2,17 @@
 # SPDX-License-Identifier: CC0-1.0
 # Copyright (C) 2021 Intel Corporation. All rights reserved.
 
+shopt -s inherit_errexit
+
 # default config
 : "${builddir:=./qbuild}"
 rootpw="root"
+
+# Only for mkosi v14 and before. v15 and above use "systemd-repart" instead,
+# see mkosi documentation and https://github.com/pmem/run_qemu/issues/88
 rootfssize="10G"
 espsize="512M"
+
 nvme_size="1G"
 efi_mem_size="2"   #in GiB
 legacy_pmem_size="2"   #in GiB
@@ -81,10 +87,12 @@ fi
 
 fail()
 {
+    {
 	printf 'FATAL: '
 	# shellcheck disable=SC2059
 	printf "$@"
 	printf '\n'
+    } >&2
 	exit 1
 }
 
@@ -156,10 +164,17 @@ nfit_results_script="$script_dir/scripts/rq_nfit_results.sh"
 # /etc/os-release is what mkosi "detect_distribution()" uses too.
 get_os()
 {
-    awk -F= 'BEGIN  { notfound=1 }
-             /^ID=/ { print $2; notfound=0; exit }
-             END    { exit notfound }'     /etc/os-release
+    local ID_def
+
+    ID_def=$(awk -F= 'BEGIN  { notfound=1 }
+             /^ID=/ { print $0; notfound=0; exit }
+             END    { exit notfound }'     /etc/os-release)
+
+    # Some distros quote the value (e.g. ID="centos"), others not.
+    bash -c "$ID_def && "'printf %s "$ID"'
 }
+
+_host_distro=$(get_os)
 
 # distro:  if any, user input passed to mkosi configuration line: "Distribution=$distro"
 # rev:     if any, user input passed to mkosi configuration line: "Release=$rev"
@@ -168,7 +183,7 @@ if [ -n "$distro" ]; then
     _distro=${distro}
     distribution_def="Distribution=$distro"
 else
-    _distro=$(get_os)
+    _distro="$_host_distro"
     distribution_def=''
 fi
 
@@ -225,9 +240,14 @@ guest_alive()
 	[ -e "$qmp_sock" ]
 }
 
+loop_devs()
+{
+	sudo losetup --noheadings --output NAME --associated "$1"
+}
+
 loop_teardown()
 {
-	for loopdev in $(sudo losetup --list | grep "$_arg_rootfs" | awk '{ print $1 }'); do
+	for loopdev in $(loop_devs "$abs_rootfs"); do
 	if [ -b "$loopdev" ]; then
 		sudo umount "${loopdev}p1" || true
 		sudo umount "${loopdev}p2" || true
@@ -247,6 +267,20 @@ cleanup()
 	set +x
 }
 
+backtrace()
+{
+	( set +x
+	for i in $(seq 1 $((${#FUNCNAME[@]}-1))); do
+
+	    line_no=${BASH_LINENO[$((i-1))]} || true
+	    # BASH_LINENO sometimes fails and falls back to 1
+	    [ "$line_no" -gt 1 ] || line_no=""
+
+	    printf '%s:%s:%s()\n'  "${BASH_SOURCE[i]}" "${line_no}" "${FUNCNAME[i]}"
+	done
+	)
+}
+
 # In POSIX theory, the shell automatically saves for us the $? of the
 # "last command before the trap"; see special built-in 'exit' in
 # "2. Shell Command Language" on opengroup.org. However this is
@@ -256,6 +290,8 @@ cleanup()
 trap 'exit_handler $?' EXIT
 exit_handler()
 {
+	test "$1" = 0 || >&2 backtrace
+
 	# 42 "breadcrumb" if forgotten and missing
 	local err="${1-42}"
 	# "set -e" can trigger _twice_ and abort the EXIT handler again!
@@ -265,6 +301,9 @@ exit_handler()
 	exit "$err"
 }
 
+# Silence SC2317 and SC2329
+# https://github.com/koalaman/shellcheck/issues/2542
+false && exit_handler "$@"
 
 # Runs a command repeatedly until it succeeds. Returns true as soon as the command returns
 # true before the timeout. Otherwise returns false and prints a timeout message.
@@ -417,6 +456,8 @@ process_options_logic()
 		set -x
 	fi
 
+	abs_rootfs=$(realpath "${builddir}/${_arg_rootfs}")
+
 	arch_init
 
 	if [[ $_arg_cxl_test_run == "on" ]]; then
@@ -490,10 +531,10 @@ process_options_logic()
 		mkosi_opts+=(-m "$_arg_mirror")
 	fi
 	if [[ $_arg_kcmd_replace && ! -f "$_arg_kcmd_replace" ]]; then
-		fail "File not found: $_arg_kcmd_replace"
+		fail "File where replacement kernel command line reside not found: $_arg_kcmd_replace not in $(pwd). Do not pass in a string!"
 	fi
 	if [[ $_arg_kcmd_append && ! -f "$_arg_kcmd_append" ]]; then
-		fail "File not found: $_arg_kcmd_append"
+		fail "File where appended kernel command line resides not found: $_arg_kcmd_append not in $(pwd). Do not pass in a string!"
 	fi
 	if [[ $_arg_gdb_qemu == "on" ]] && [[ $gdb == "gdb" ]]; then
 		gdb_extra=("-ex" "handle SIGUSR1 noprint nostop")
@@ -567,6 +608,7 @@ install_build_initrd()
 	# and it expects a /lib/modules/$kver/vmlinuz
 	cp "$inst_path/vmlinuz-$kver" "$inst_prefix/lib/modules/$kver/vmlinuz"
 
+	local ret=0
 	dracut --force --verbose \
 		--no-hostonly \
 		--show-modules \
@@ -574,10 +616,31 @@ install_build_initrd()
 		--kmoddir "$inst_prefix/lib/modules/$kver/" \
 		--kernel-image "./vmlinux" \
 		--add "bash systemd kernel-modules fs-lib" \
-		--omit "iscsi fcoe fcoe-uefi" \
+		--omit "iscsi fcoe fcoe-uefi multipath" \
 		--omit-drivers "nfit libnvdimm nd_pmem" \
-		"$inst_path/initramfs-$kver.img"
+		"$inst_path/initramfs-$kver.img" || {
+	    ret=$?
+	    _dracut_106_warning
+	    }
+	return $ret
 }
+
+_dracut_106_warning()
+{
+	local _ver; _ver=$(dracut --version | awk '{print $2}')
+
+	[ "$_ver" = 106 ] || [ "$_ver" = 107 ] || return
+
+	# Fedora was never affected, see 1242 why
+	cat <<-EOF >&2
+
+	WARNING: some dracut versions v106 and v107 can fail with the following error
+	    *shadow: Cannot open: Permission denied
+	See bug https://github.com/dracut-ng/dracut-ng/issues/1242
+
+EOF
+}
+
 
 __build_kernel()
 {
@@ -590,11 +653,6 @@ __build_kernel()
 		quiet="--quiet"
 	fi
 
-	mkdir -p "$inst_path"
-	# /lib -> /usr/lib
-	mkdir -p "${inst_prefix}/usr/lib"
-	ln -sf usr/lib "${inst_prefix}/lib"
-
 	if [[ $_arg_defconfig == "on" ]]; then
 		make $quiet olddefconfig
 		make $quiet prepare
@@ -602,6 +660,11 @@ __build_kernel()
 	kver=$(make -s kernelrelease)
 	test -n "$kver"
 	make $quiet -j"$num_build_cpus"
+
+	mkdir -p "$inst_path"
+	# /lib -> /usr/lib
+	mkdir -p "${inst_prefix}/usr/lib"
+	ln -sf usr/lib "${inst_prefix}/lib"
 
 	# Install Modules Strip = ims
 	local ims=""
@@ -709,7 +772,7 @@ get_loopdev()
 {
 	local loopdev num_loopdev
 
-	loopdev="$(sudo losetup --list | grep "$_arg_rootfs" | awk '{ print $1 }')"
+	loopdev=$(loop_devs "$abs_rootfs")
 	# We cannot count newlines with `wc -l` because $( ) trims the trailing
 	# newline which makes 0 and 1 loopback device give the same count.
 	num_loopdev=$(grep -c dev/loop <<<"$loopdev")
@@ -717,11 +780,11 @@ get_loopdev()
 	if (( num_loopdev != 1 )); then
 		{ lsblk -f || true
 		sudo losetup --list
-		fail "Expected 1 loopdev for $_arg_rootfs, found $num_loopdev.
+		fail "Expected 1 loopdev for $abs_rootfs, found $num_loopdev.
 \tTry 'sudo losetup -D' to remove any stale loopdevs"
 		} >&2 # get_loopdev() stdout is normally captured
 	fi
-	test -b "$loopdev" || fail "%s is not a block device" "$loopdev" >&2
+	test -b "$loopdev" || fail "%s is not a block device" "$loopdev"
 	printf '%s' "$loopdev"
 }
 
@@ -831,7 +894,9 @@ build_kernel_cmdline()
 	fi
 	if [[ $_arg_gcp == "off" ]]; then
 		# https://systemd.io/CREDENTIALS/
-		# This requires systemd v251 or above (commit 4b9a4b017, April 2022)
+		# This requires: - systemd v251 or above (commit 4b9a4b017, April 2022)
+		# - util-linux agetty 2.40 or above,
+		# - /bin/login from util-linux, not "shadow" /bin/login. See #169
 		kcmd+=(
 			systemd.set_credential=agetty.autologin:root
 			systemd.set_credential=login.noauth:yes
@@ -930,13 +995,25 @@ update_rootfs_boot_kernel()
 	sudo cp "$builddir/mkosi.extra/boot/vmlinuz-$kver" "$builddir/mnt/run-qemu-kernel/$kver/vmlinuz"
 
 	defconf="$builddir/mnt/loader/loader.conf"
+	local loader_timeout=4
+
+	# mkosi->"bootctl install ..." creates a stub loader.conf.
+	# It can also come from a previous run of this script.
 	if [ -f "$defconf" ]; then
-		sudo sed -i -e 's/^#.*timeout.*/timeout 4/' "$defconf"
-		sudo sed -i -e '/default.*/d' "$defconf"
-	else
-		echo "timeout 4" | sudo tee "$defconf"
+		# Comment out existing values. Last value seems to win but it's not
+		# documented in "man loader.conf" so let's not rely on it
+		sudo sed -i -e 's/^[[:blank:]]*timeout\(.*\)/# timeout \1/' "$defconf"
+		sudo sed -i -e 's/^[[:blank:]]*default\(.*\)/# default \1/' "$defconf"
 	fi
-	echo "default run-qemu-kernel-$kver.conf" | sudo tee -a "$defconf"
+
+	{
+	    generatedfrom_header "update_rootfs_boot_kernel() >> $defconf"
+            cat <<EOF
+timeout $loader_timeout
+default run-qemu-kernel-$kver.conf
+
+EOF
+	}  | sudo tee -a "$defconf"
 
 	[[ "$_arg_legacy_bios" == 'on' ]] || install_opt_efi_shell
 
@@ -957,7 +1034,7 @@ install_opt_efi_shell()
 {
 	local efi_shell
 	local _usr=/usr/share
-	case "${_distro}__${guest_arch_toolchain}" in
+	case "${_host_distro}__${guest_arch_toolchain}" in
 	    fedora__x86_64)
 		efi_shell=${_usr}/edk2/ovmf/Shell.efi ;;
 
@@ -1165,28 +1242,49 @@ check_ndctl_dir()
 
 prepare_ndctl_build()
 {
-	local postinst=mkosi.postinst
-	# Until mkosi v18 (commit a28c268996fa), only one postinst script is
-	# supported. So, we concatenate. One drawback: you must manually delete
-	# qbuild/mkosi.postinst when changing this code below.
-	if test -e "$postinst" && grep -q 9b626c647037bc8a "$postinst"; then
-		return
-	fi
-	cat <<- 'EOF' >> "$postinst"
+	cat <<- 'EOF' | postinst_append_if_not_found 9b626c647037bc8a
 		#!/bin/sh
 		# v14: 'systemd-nspawn"; v15: "mkosi"
 		printf 'container=%s\n' "$container"
 		# .postinst and others moved outside container in mkosi v15, see
 		# https://github.com/systemd/mkosi/commit/9b626c647037bc8a
-		if [ -n "$container" ]; then
+		if [ -n "$container" ]; then # before mkosi v15
 			/root/reinstall_ndctl.sh
-		else
+		else # mkosi v15 and above
 			# The magic, short-lived $SCRIPT variable is already deprecated
 			# and we don't need it.
 			mkosi-chroot /root/reinstall_ndctl.sh
 		fi
 	EOF
-	chmod +x "$postinst"
+}
+
+prepare_shadow_autologin()
+{
+	cat <<- EOF | postinst_append_if_not_found  shadow_autologin.sh
+		#!/bin/sh
+		trusted_console=$console mkosi-chroot /root/rq/shadow_autologin.sh
+	EOF
+}
+
+# Append stdin to the mkosi.postinst script if the $1 argument
+# "watermark" is not already found there. Otherwise discard stdin.
+# WARNING: this function adds comments with a '# ' prefix.
+postinst_append_if_not_found()
+{
+	local watermark="$1"
+	local _outputf=mkosi.postinst
+	# Until mkosi v18 (commit a28c268996fa),  only one postinst script is
+	# supported. So, we concatenate. One drawback:  you must manually delete
+	# qbuild/mkosi.postinst when changing run_qemu.sh
+	if test -e "$_outputf" && grep -q -e "$watermark" "$_outputf"; then
+		cat >/dev/null
+		return
+	fi
+	{ cat
+	  generatedfrom_header "postinst_append_if_not_found $watermark"
+	  printf '###  -----------------------\n\n'
+	} >> "$_outputf"
+	chmod +x "$_outputf"
 }
 
 setup_gcp_tweaks()
@@ -1271,7 +1369,7 @@ make_rootfs()
 	local tmpl dst_base
 	for tmpl in "${script_dir}/${mkosi_ver_d}"/*.tmpl \
 		    "${script_dir}"/mkosi_tmpl_portable/*.tmpl \
-		    "${script_dir}"/mkosi.${_distro}.default.tmpl; do
+		    "${script_dir}"/mkosi."${_distro}".default.tmpl; do
 		dst_base=$(basename "${tmpl}")
 		# Strip all suffixes
 		dst_base=${dst_base%.tmpl}
@@ -1323,6 +1421,17 @@ make_rootfs()
 		fi
 	fi
 
+	case "$_distro" in
+	    debian|ubuntu)
+		# "set_credential login.noauth" is recognized by util-linux "login" but not by
+		# https://github.com/shadow-maint/shadow login program, see
+		# https://github.com/pmem/run_qemu/issues/169. So we hack the PAM configuration
+		# instead.
+		if test "$mkosi_ver" -ge 15; then
+		    prepare_shadow_autologin
+		fi ;;
+	esac
+
 	# timedatectl defaults to UTC when /etc/localtime is missing
 	local bld_tz; bld_tz=$( timedatectl | awk '/zone:/ { print $3 }' )
 	# v15 commit f11325afa02c "Adopt systemd-firstboot"
@@ -1361,10 +1470,14 @@ make_rootfs()
 	setup_autorun "mkosi.extra"
 
 	if [[ $_arg_debug == "on" ]]; then
-	    # In case of yet another mkosi incompatibility or other issue,
-	    # enable this line. WARNING: --debug options have "stability" issues
-	    # too! Check the man page of your specific mkosi version
-	    : # mkosi_opts+=('--debug-workspace' '--debug-shell' '--debug')
+		if test "$mkosi_ver" -lt 15; then
+			mkosi_opts+=('--debug=run')
+		else # See mkosi v15 commit a13e4b0e7056cc
+			mkosi_opts+=('--debug')
+		fi
+		# Newer options check the man page of your specific mkosi
+		# version, find links a the bottom of run_qemu/README.md
+		# mkosi_opts+=('--debug-workspace' '--debug-shell')
 	fi
 
 	mkosi_opts+=("build")
@@ -1534,7 +1647,7 @@ edk2_vmf_configure()
 	# 2. later stopped building 2M images
 	# ... but only for x86_64 - more Debian inconsistency...
 	# See the package README file(s).
-	case "${_distro}__${guest_arch_toolchain}" in
+	case "${_host_distro}__${guest_arch_toolchain}" in
 	    debian__x86_64 | ubuntu__x86_64)
 		image_suffix=_4M.fd ;;
 	    *)
@@ -1546,9 +1659,11 @@ edk2_vmf_configure()
 
 	# $edk2_vmf_path default value; can be overriden by the environment
 	local xvmf_dir
-	case "${_distro}__${guest_arch_toolchain}" in
+	case "${_host_distro}__${guest_arch_toolchain}" in
 	    arch__x86_64)
 		xvmf_dir=OVMF/ovmf  ;;
+	    centos__x86_64)
+		xvmf_dir=edk2/ovmf ;;
 	    *)
 		xvmf_dir="$xVMF"  ;;
 	esac
@@ -1680,7 +1795,11 @@ prepare_qcmd()
 {
 	# this step may expect files to be present at the toplevel, so run
 	# it before dropping into the builddir
-	build_kernel_cmdline "/dev/sda2"
+	mount_rootfs 2
+	local root_partuuid; root_partuuid=$(get_partuuid "${loopdev}" 2)
+	umount_rootfs 2
+
+	build_kernel_cmdline "PARTUUID=${root_partuuid}"
 
 	pushd "$builddir" > /dev/null || exit 1
 
@@ -1778,8 +1897,24 @@ prepare_qcmd()
 		;;
 	esac
 
-	qcmd+=("-drive" "file=$_arg_rootfs,format=raw,media=disk")
-	if [ $_arg_direct_kernel = "on" ] && [ -n "$vmlinuz" ] && [ -n "$initrd" ]; then
+	if [[ $_arg_rw == 'on' ]]; then
+		qcmd+=("-blockdev" "driver=file,node-name=maindisk,filename=${_arg_rootfs}")
+	else
+		local _overlay=${_arg_rootfs}-overlay.qcow2
+		rm -f "${_overlay}"
+		qemu-img create -F raw -b "${_arg_rootfs}" -f qcow2 "${_overlay}"
+		# "Finding your way through the QEMU parameter jungle"
+		# -- Thomas Huth
+		qcmd+=("-blockdev" "file,node-name=mainoverlay,filename=${_overlay}")
+		qcmd+=("-blockdev" "qcow2,node-name=maindisk,file=mainoverlay")
+	fi
+
+	qcmd+=("-device"   "virtio-blk,bus=pcie.0,drive=maindisk")
+
+	if [ $_arg_direct_kernel = "on" ]; then
+		local _err_fmt; _err_fmt="no %s found in $(pwd)/mkosi.extra/; try --no-direct-kernel?"
+		[ -n "$vmlinuz" ] || fail "$_err_fmt" 'vmlinuz*'
+		[ -n "$initrd" ]  || fail "$_err_fmt" 'initramfs*'
 		qcmd+=("-kernel" "$vmlinuz" "-initrd" "$initrd")
 		qcmd+=("-append" "${kcmd[*]}")
 	fi
@@ -1817,6 +1952,7 @@ prepare_qcmd()
 	fi
 
 	if [[ $_arg_rw == "off" ]]; then
+		# Note this is only for the (deprecated) -drive and ignored by -blockdev
 		qcmd+=("-snapshot")
 	fi
 
@@ -1896,14 +2032,15 @@ start_qemu()
 	else
 		printf "guest will be terminated after %d minute(s)\n" "$_arg_timeout"
 		"${qcmd[@]}" & sleep 5
-		timeout_sec="$(((_arg_timeout * 60) - 5))"
+		( timeout_sec="$(((_arg_timeout * 60) - 5))"
 		while ((timeout_sec > 0)); do
 			if ! guest_alive; then
 				break
 			fi
 			sleep 5
 			timeout_sec="$((timeout_sec - 5))"
-		done
+			set +x
+		done )
 		kill_guest
 	fi
 	popd > /dev/null || exit 1
@@ -1924,6 +2061,12 @@ main()
 	# Optional
 	mkdir -p /tmp/rq_mkosi_wspaces/
 	process_options_logic
+
+	# Clean old kernels in qbuild/mkosi.extra/ and other outdated stuff from previous
+	# builds. This avoids old, non-functional kernels in the bootloader menus and confusing
+	# ESP "disk full" failures, see https://github.com/systemd/mkosi/issues/3948
+	[[ $_arg_rebuild = no* ]] || rm -rf "$builddir"/mkosi.extra/
+	# Files in ../run_qemu/mkosi.extra/ will be copied and installed again later.
 
 	case "$_arg_rebuild" in
 		kmod)
@@ -1978,4 +2121,9 @@ main()
 	fi
 }
 
-main
+# This compound statement { } forces bash to read it entirely before
+# running it. This allows modifying the script while it's running.
+# https://hachyderm.io/@simontatham/114511220670677410
+{
+	main; exit $?
+}

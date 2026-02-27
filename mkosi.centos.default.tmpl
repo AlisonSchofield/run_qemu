@@ -1,5 +1,13 @@
+# This successfully built Centos 10 on Arch Linux with mkosi 25.3 as of
+# October 2025. This is not much and only manual testing but it is still
+# vastly better than no starting point at all.
+
+[Distribution]
+Repositories=epel
+
 [Content]
 Packages=
+  epel-release # "Repositories=epel" above takes effect only at image build time.
   openssh-clients
   openssh-server
   fuse-sshfs
@@ -17,7 +25,6 @@ Packages=
   vim-enhanced
   net-tools
   iproute
-  dhclient
   nmap-ncat
   lsof
   dnf
@@ -29,9 +36,7 @@ Packages=
   numactl
   numactl-libs
   fio
-  fio-engine-dev-dax
   fio-engine-libaio
-  fio-engine-libpmem
   strace
   ltrace
   procps-ng
@@ -41,7 +46,6 @@ Packages=
   acpica-tools
   autoconf
   asciidoc
-  rubygem-asciidoctor
   xmlto
   automake
   libtool
@@ -64,12 +68,10 @@ Packages=
   hostname
   gdb
   tree
-  htop
   nvme-cli
   cargo
   meson
   ninja-build
-  vbindiff
   trace-cmd
   xxd
   libtraceevent
@@ -79,7 +81,7 @@ Packages=
   pciutils
   bind-utils
   systemd-resolved
-  systemd-networkd
   perf
   hwloc
   systemd-boot-unsigned
+

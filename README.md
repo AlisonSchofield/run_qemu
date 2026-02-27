@@ -73,6 +73,16 @@ check the long mkosi section below.
          UserKnownHostsFile /dev/null
 
     And then `ssh rq`. You may need to open port 10022 on any local firewalls.
+    Then, the `dpipe` and `sshfs` programs can be used to let the guest access
+    host files. For instance, as found in `man sshfs`:
+       `dpipe /usr/lib/ssh/sftp-server = ssh rq sshfs :$HOME/CXL /root/CXL -o passive`
+    "sshfs -o passive" uses stdin and stdout instead of the guest connecting back
+    to the host over the network.
+    If you don't have `dpipe`, try the slightly less efficient:
+      `socat EXEC:/usr/lib/ssh/sftp-server SHELL:"'ssh rq sshfs :$HOME/CXL /root/CXL -o passive'"`
+    Supposedly faster file sharing options like 9P or virtiofs exist too but
+    they require much more complex configuration. `sshfs` generally
+    works out of the box.
  - The root password for the guest VM is `root` by default but note many Linux
    distributions restrict remote root access in various ways. The serial console
    automatically logs in, and a password isn't required.
@@ -97,7 +107,7 @@ The script enables generating a sane QEMU commandline for instantiating a basic 
 - --dax-debug: Add any and all flags for extra debug of dax modules (kernel)
 
 ### Kernel config
-- Make sure to Turn on CXL related options in the kernel's .config:
+- Make sure to Turn on CXL related options in the kernel's .config, at least:
 ```
 $ grep -i cxl .config
 CONFIG_CXL_BUS=y
@@ -108,6 +118,13 @@ CONFIG_CXL_PMEM=m
 CONFIG_CXL_MEM=m
 CONFIG_CXL_PORT=y
 CONFIG_CXL_SUSPEND=y
+```
+
+For a more complete list, you can re-use the `*.cfg` files used in
+`.github/` CI as a good starting point:
+```
+make defconfig
+./scripts/kconfig/merge_config.sh .config ../run_qemu/.github/workflows/*.cfg
 ```
 
 The following is a way to check basic sanity within the QEMU guest:
